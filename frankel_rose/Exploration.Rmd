@@ -1,0 +1,103 @@
+---
+title: "Investigating Frankel and Rose (1996)"
+header-includes:
+- \usepackage{graphicx}
+- \usepackage{float}
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+bibliography: bib.bib
+---
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(countrycode)
+library(imfr)
+library(foreign)
+library(ggthemr)
+library(stargazer)
+library(summarytools)
+library(knitr)
+library(caret)
+library(kableExtra)
+library(RANN)
+library(reshape2)
+library(taRifx)
+library(ROCR)
+
+crisis_theme <- function(){
+  theme(legend.position="right",legend.direction="vertical",
+        legend.margin=margin(grid::unit(0,"cm")),
+        legend.text=element_text(size=7,face="bold"),
+        legend.key.height=grid::unit(0.8,"cm"),
+        legend.key.width=grid::unit(0.2,"cm"),
+        axis.line=element_blank(),
+        axis.text.x=element_text(size=8),
+        axis.text.y=element_text(size=5, vjust=0.2),
+        #axis.ticks=element_line(size=0.4),
+        axis.ticks=element_blank(),
+        plot.background=element_blank(),
+        panel.border=element_blank(),
+        panel.background=element_blank(),
+        plot.margin=margin(0.7,0.4,0.1,0.2,"cm"))
+}    
+
+# write a function which can be reused!
+ols2Stargazer <- function(model, title, name) {
+  
+  # this gives out the basic latex file
+  latex <- capture.output({stargazer(model,          
+                                     title = title, type = "latex",
+                                     model.numbers = T,
+                                     multicolumn = T,
+                                     intercept.bottom = T,
+                                     table.layout ="-ldc#-t-s-n",
+                                     df = FALSE, digits = 3, header = T, float = T, table.placement = "H")})
+    
+  latex <- gsub("\\begin{tabular}","\\resizebox{0.4\\linewidth}{!}{\\begin{tabular}", latex, fixed=T)
+  latex <- gsub("\\end{tabular}","\\end{tabular}}", latex, fixed=T)
+  
+  # save a copy
+  cat(latex, file = paste0("./tables/", name, ".tex"), sep = "\n")
+  
+  return(latex)
+  
+}
+```
+
+# A Helper function to align crisis dates
+```{r}
+realign_crisis0 <- function(df) {
+  
+  country_list <- df %>% split(., .$country)
+  
+  by_country <- lapply(country_list, function(country) {
+    
+    crisis_dates <- country %>% filter(event == 1) %>% pull(date)
+    
+    crisis <- lapply(crisis_dates, function(x){
+      
+      #lower_end = x - 3
+      #upper_end = x + 3
+      
+      df <- country %>%
+        #filter(date >= lower_end & date <= upper_end) %>%
+        mutate(crisis0 = x,
+               index = date - x) %>%
+        # get rid of data that are within 5 years of a crisis
+        filter(!(index >= 0 & index < 5)) %>%
+        # an alternative event classification
+        mutate(event = ifelse((index < 0 & index >= -2), 1, 0))
+    
+    }) %>% bind_rows()
+    
+  }) %>% bind_rows()
+  
+  return(by_country)
+  
+}
+```
+

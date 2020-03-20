@@ -1,0 +1,687 @@
+---
+title: "Investigating Frankel and Rose (1996)"
+header-includes:
+- \usepackage{graphicx}
+- \usepackage{float}
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+bibliography: bib.bib
+---
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(countrycode)
+library(imfr)
+library(foreign)
+library(ggthemr)
+library(stargazer)
+library(summarytools)
+library(knitr)
+library(caret)
+library(kableExtra)
+library(RANN)
+library(reshape2)
+library(taRifx)
+library(ROCR)
+library(DMwR)
+library(pROC)
+library(ROSE)
+
+ggthemr("flat")
+
+crisis_theme <- function(){
+  theme(legend.position="right",legend.direction="vertical",
+        legend.margin=margin(grid::unit(0,"cm")),
+        legend.text=element_text(size=7,face="bold"),
+        legend.key.height=grid::unit(0.8,"cm"),
+        legend.key.width=grid::unit(0.2,"cm"),
+        axis.line=element_blank(),
+        axis.text.x=element_text(size=8),
+        axis.text.y=element_text(size=5, vjust=0.2),
+        #axis.ticks=element_line(size=0.4),
+        axis.ticks=element_blank(),
+        plot.background=element_blank(),
+        panel.border=element_blank(),
+        panel.background=element_blank(),
+        plot.margin=margin(0.7,0.4,0.1,0.2,"cm"))
+}    
+
+# write a function which can be reused!
+ols2Stargazer <- function(model, title, name) {
+  
+  # this gives out the basic latex file
+  latex <- capture.output({stargazer(model,          
+                                     title = title, type = "latex",
+                                     model.numbers = T,
+                                     multicolumn = T,
+                                     intercept.bottom = T,
+                                     table.layout ="-ldc#-t-s-n",
+                                     df = FALSE, digits = 3, header = T, float = T, table.placement = "H")})
+    
+  latex <- gsub("\\begin{tabular}","\\resizebox{0.4\\linewidth}{!}{\\begin{tabular}", latex, fixed=T)
+  latex <- gsub("\\end{tabular}","\\end{tabular}}", latex, fixed=T)
+  
+  # save a copy
+  cat(latex, file = paste0("./tables/", name, ".tex"), sep = "\n")
+  
+  return(latex)
+  
+}
+
+calc_error_rate <- function(predicted.value, true.value)
+                    {return(mean(true.value!=predicted.value))}
+```
+
+# Goals
+
+1. Replicate @frankel1996currency which is a simple probit model but choose probability cutoff to maximise the area under the ROC curve.
+2. Show off-the-shelf machine learning on the same dataset: random forest, KNN and SVN
+
+# Summary of findings
+
+1. Probit models often do not need tuning but in the context of imbalanced dataset, we can make a probit model much more sensitive by setting the threshold of classifying a crisis observation low. For instance, as opposed to using a 50% cut-off (i.e. when predicted probability exceeds 0.5, classify the obs as crisis), you can use other cut-off values. Below I used the value to maximise the area under the ROC curve.
+2. After making this change, the gap between probit and machine learning algos shrinks although random forest and KNN still do better. Mind you without "tuning" the probit model, its performance is nowhere close to its ML counterparts.
+
+# Note to self
+
+1. The main difficulty of this prediction task comes from the imbalance of classes - we have more non-crisis obs than crisis.
+2. Of course one way to do it is to oversample the minority class...which I did in this script, but it just feels unnatural to just generate more data points.
+3. In the literature, quite a few papers are horse races of conventional machine learning and almost all manage to show ML algos do better. But of course they are - they are built for predictions. 
+4. So to stand out, you either come up with a more interpretable model or find a novel way to deal with the class imbalance, or indeed come up with even more advanced models. 
+5. Intepretability of ML models is big among the ai guys. While the goal here is not casuality but still we will want to know which variable is more important in shaping the forecast. And there are quite a few libraries out there in python that do this: scikit learn plus tons others.
+6. When it comes to a novel way to deal with class imbalance, a natural fit (and it so happens it's one of the models fewer people know of) is an autoeoncoder which can be paired with LSTM and CNN. The idea is simple, just train the model using the non-crisis data, then you will have a good idea of how things play out in no crisis. Then reconstruct the whole dataset using the trained model. Then what you should see is that reconstruction error is low where there is no crsis, and shoots up when there is one. This way you do not have to oversample the dataset to solve the class imbalance.
+7. Another additional benefit is that with LSTM you also make use of the time dimension in classification.
+
+# Replicate @frankel1996currency
+
+## Data
+
+I managed to find the underlying data from Rose's personal website (http://faculty.haas.berkeley.edu/arose/RecRes.htm, scroll down to "Banking and Exchange Crises in Developing Countries"). He also provided the STATA file used for data-cleaning. A summary of what they did is provided in the next section.
+
+```{r message=FALSE, warning=FALSE}
+#replicating Frankel and Rose (1996)
+frankel_rose_data <- read.dta("./stata/cleanrose12.dta")
+
+write.csv(frankel_rose_data, "frankel_rose_data.csv")
+```
+
+## Data cleaning
+
+@frankel1996currency estimated a probit model in an attempt to explain the incidence of currency crisis for over 100 developing countries across between 1971 to 1992. In their paper, a currency crisis is defined by 2 criteria:
+
+\begin{enumerate}
+    \item Nominal exchange rate increases by 25\% or more in a year; and,
+    \item The rate of increase is at least 10\% or more than the growth rate in the previous year. 
+\end{enumerate}
+
+In order to avoid double-counting a crisis, crises that are within 3 years of each other are excluded from the sample. This results in 117 episodes of currency crises which are plotted in figure \ref{frankel_rose_crisis_calendar}.
+
+The list of explanatory variables used is shown as follows:
+
+\begin{enumerate}
+    \item \textbf{comrat}: Commercial bank debt (as \% of total debt)
+    \item \textbf{conrat}: Concessional debt (as \% of total debt)
+    \item \textbf{varrat}: Variable debt (as \% of total debt)
+    \item \textbf{fdistock}: FDI stock
+    \item \textbf{shorttot}: Short-term debt (as \% of total debt)
+    \item \textbf{pubrat}: Public sector debt (as \% of total debt)
+    \item \textbf{multirat}: Multilateral debt (as \% of total debt)
+    \item \textbf{debty}: Total debt (as \% of GNP)
+    \item \textbf{reservem}:  Ratio of international reserves to monthly imports
+    \item \textbf{cacc}: Current account (as \% of GDP)
+    \item \textbf{defrat}: Government position (as \% of GNP)
+    \item \textbf{dlcred}: Percentage growth of domestic credit
+    \item \textbf{dly}: Percentage growth of per capita GNP
+    \item \textbf{istar}: Foreign interest rate
+    \item \textbf{overaln}: Real exchange rate divergence (over-valuation)
+\end{enumerate}
+
+The STATA script that does all these transformations can be found in `stata/rose_dat_cleaning.do`
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+make_calender <- function(df) {
+ 
+  df %>%
+    ggplot(aes(x = date, y = country, fill = factor(event))) +
+    geom_tile(colour="white",size=0.2) +
+    scale_y_discrete(expand=c(0,0)) +
+    scale_x_continuous(expand=c(0,0), breaks=seq(1971, 1992, 1)) +
+    # prefer a manual scale to make it looks better
+    scale_fill_manual(values=c("grey90","#d53e4f"), name = "Incidence") + 
+    labs(title = "Incidence of Currency Crisis, 1971 - 1992", subtitle = "Currency crises identified in Frankel and Rose (1996)",
+         x = "", y = "") +
+    crisis_theme()
+
+}
+
+frankel_rose_crisis_calendar <- frankel_rose_data %>%
+  # turn country into factor so you can arrange it any way you want
+  mutate(country = factor(country, levels = rev(sort(unique(country)))),
+         event = ifelse(is.na(event), 0, event)) %>%
+  make_calender(.)
+
+ggsave("./graphs/frankel_rose_crisis_calendar.pdf",
+       frankel_rose_crisis_calendar,
+       width = 297, 
+       height = 210, 
+       units = "mm")
+```
+
+\begin{figure}[H]
+  \caption{117 episodes of currency crisis identified in Frankel and Rose (1996)}
+  \vspace{1ex}{
+    \includegraphics[width=\linewidth]{graphs/frankel_rose_crisis_calendar}
+    \label{frankel_rose_crisis_calendar}}
+\end{figure}
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+realign_crisis0 <- function(df) {
+  
+  country_list <- df %>% split(., .$country)
+  
+  by_country <- lapply(country_list, function(country) {
+    
+    crisis_dates <- country %>% filter(event == 1) %>% pull(date)
+    
+    crisis <- lapply(crisis_dates, function(x){
+      
+      #lower_end = x - 3
+      #upper_end = x + 3
+      
+      df <- country %>%
+        #filter(date >= lower_end & date <= upper_end) %>%
+        mutate(crisis0 = x,
+               index = date - x) %>%
+        # get rid of data that are within 2 years after a crisis -
+        # this is the prevent post-crisis bias
+        filter(!(index >= 0 & index < 2)) %>%
+        # an alternative event classification
+        mutate(event = ifelse((index < 0 & index >= -2), 1, 0))
+    
+    }) %>% bind_rows()
+    
+  }) %>% bind_rows()
+  
+  return(by_country)
+  
+}
+
+frankel_rose_data_realigned <- frankel_rose_data %>%
+  # turn country into factor so you can arrange it any way you want
+  mutate(country = factor(country, levels = rev(sort(unique(country))))) %>%
+  realign_crisis0(.) 
+
+frankel_rose_data_realigned_calender <- frankel_rose_data_realigned %>%
+  select(name, country, date, event) %>%
+  unique(.) %>% 
+  make_calender(.) +
+  labs(title = "Realigned Incidence of Currency Crisis, 1971 - 1992",
+       subtitle = "t-1 and t-2 of Currency crises identified in Frankel and Rose (1996)",
+         x = "", y = "")
+  
+ggsave("./graphs/frankel_rose_data_realigned_calender.pdf",
+       frankel_rose_data_realigned_calender,
+       width = 297, 
+       height = 210, 
+       units = "mm")
+```
+
+\begin{figure}[H]
+  \caption{Realigned Incidence of Currency Crisis, 1971 - 1992}
+  \vspace{1ex}{
+    \includegraphics[width=\linewidth]{graphs/frankel_rose_data_realigned_calender}
+    \label{frankel_rose_data_realigned_calender}}
+\end{figure}
+
+After the re-alignment, the percentage of crisis observations goes up from 6% to around 11%.
+
+```{r, echo=FALSE, include=FALSE}
+crisis_percent_before <- frankel_rose_data %>%
+  filter(!is.na(event)) %>%
+  mutate(total = n()) %>%
+  group_by(event, total) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  mutate(percent = count/total,
+         type = "Before")
+
+crisis_percent_after <- frankel_rose_data_realigned %>%
+  mutate(total = n()) %>%
+  group_by(event, total) %>%
+  summarise(count = n()) %>%
+  ungroup() %>%
+  mutate(percent = count/total,
+         type = "After")
+
+crisis_percent <- rbind(crisis_percent_before, crisis_percent_after) %>%
+  ggplot(aes(x = as.factor(event), y = percent)) +
+  geom_col(aes(fill = as.factor(event)), show.legend = F) +
+  facet_wrap(~type) +
+  labs(title = "Percentage of Crisis Before and After Realignment",
+       x = "Crisis", y = "Percent (%)")
+
+ggsave("./graphs/crisis_percent.pdf",
+       crisis_percent,
+       width = 297, 
+       height = 210, 
+       units = "mm")
+```
+
+\begin{figure}[H]
+  \caption{Percentage of Crisis Before and After Realignment}
+  \vspace{1ex}{
+    \includegraphics[width=\linewidth]{graphs/crisis_percent}
+    \label{crisis_percent}}
+\end{figure}
+
+## Replication
+
+A close, *but not exact*, replication of tge probit results in @frankel1996currency is shown in table \ref{frankel_rose_probit}.
+
+```{r message=FALSE, warning=FALSE}
+# run a simple probit model here
+frankel_rose_probit <- glm(event ~ comrat + conrat + varrat + fdistock + shorttot + pubrat +
+                             multirat + debty + reservem + cacc + defrat + dlcred + dly +
+                             istar + overvaln, family = binomial(link = "probit"), 
+                data = frankel_rose_data)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+frankel_rose_probit_stargazed <- ols2Stargazer(model = frankel_rose_probit,
+                                               title = "Baseline probit estimates in Frankel and Rose (1996)\\label{frankel_rose_probit}",
+                                               name = "frankel_rose_probit")
+```
+
+\input{tables/frankel_rose_probit.tex}
+
+# Moving into machine learning
+
+## Create a score card
+
+```{r message=FALSE, warning = FALSE}
+records = matrix(NA, nrow = 4, ncol=2) 
+colnames(records) <- c("train.error", "test.error")
+rownames(records) <- c("Probit", "KNN", "Random Forests", "SVM")
+```
+
+## Partition the data
+```{r message=FALSE, warning = FALSE}
+frankel_rose_data_ML <- frankel_rose_data_realigned %>%
+  mutate(event = ifelse(is.na(event), 0, event),
+         event = factor(event, levels = c("0", "1"), labels = c("no", "yes"))) %>%
+  # keep a smaller subset, simplify subsequent codes
+  select(event, comrat, conrat, varrat,
+         fdistock, shorttot, pubrat, multirat, debty,
+         reservem, cacc, defrat, dlcred, dly, istar, overvaln)
+
+#frankel_rose_data_ML_cleaned <- frankel_rose_data_ML[complete.cases(frankel_rose_data_ML), ]
+
+# generate row indices for training data
+set.seed(2019)
+in_train <- createDataPartition(frankel_rose_data_ML$event,
+                                p = 0.8, list=FALSE)
+
+training <- frankel_rose_data_ML[in_train, ] 
+test <- frankel_rose_data_ML[-in_train, ] 
+
+# imputing missing variables using bagged trees
+# an easy tutorial can be found here:
+# http://rismyhammer.com/ml/Pre-Processing.html
+
+# covariates live in columns 2-16
+preProc <- preProcess(method = "bagImpute", training[, 2:16])
+training[, 2:16] <- predict(preProc, training[, 2:16]) 
+test[, 2:16] <- predict(preProc, test[, 2:16])
+
+write.csv(training, "training.csv")
+write.csv(test, "test.csv")
+```
+
+## Probit
+```{r message=FALSE, warning = FALSE}
+probit_fit <- glm(event ~ ., family = binomial(link = "probit"), data = training)
+
+# Training
+prob_train <- predict(probit_fit, type = "response")
+
+# Quick look at the ROC
+# Do it by hand for now, can write a function later
+
+prob_train_roc <- roc(training$event, prob_train)
+
+# this shows the roc curve
+plot(prob_train_roc, print.thres = "best", print.thres.best.method = "closest.topleft")
+
+# look for the best top-left cutoff
+prob_train_coords <- coords(prob_train_roc, "best", best.method = "closest.topleft", ret = c("threshold", "accuracy"))
+
+# Choose the best cut-off
+prob_train_labels = training %>%
+  mutate(predicted.value = factor(ifelse(prob_train <= prob_train_coords$threshold, "no", "yes"), levels = c("no", "yes")))
+
+probit_train_error <- calc_error_rate(predicted.value = prob_train_labels$predicted.value, true.value = training$event)
+
+# Test
+prob_test <- predict(probit_fit, newdata = test, type = "response")
+
+prob_test_labels = test %>%
+  mutate(predicted.value = factor(ifelse(prob_test <= prob_train_coords$threshold, "no", "yes"), levels = c("no", "yes")))
+
+probit_test_error <- calc_error_rate(predicted.value = prob_test_labels$predicted.value, true.value = test$event)
+
+# write down the training and test errors of the probit model 
+records[1,] <- c(probit_train_error, probit_test_error)
+```
+
+# Entering Machine Learning
+
+## Oversampling technique
+
+Here I show the code that oversamples the minority class (i.e. having a crisis) using the algorithm from @chawla2002smote
+
+Before:
+```{r message=FALSE, warning = FALSE}
+table(training$event)
+```
+
+After oversampling:
+```{r message=FALSE, warning = FALSE}
+set.seed(2019)
+smote_train <- SMOTE(event ~ ., data = training)
+table(smote_train$event)
+```
+
+Set up train control for all machine learning models
+
+```{r message=FALSE, warning=FALSE}
+over_sampling <- trainControl(method = "cv", 
+                              number = 10, 
+                              verboseIter = F, # don't print iterations
+                              sampling = "smote", # over-sampling technique from chawla2002smote
+                              savePredictions = "final",
+                              classProbs=TRUE,
+                              summaryFunction = twoClassSummary)
+```
+
+## KNN
+
+```{r message=FALSE, warning = FALSE}
+set.seed(2019)
+
+knn_fit <- train(event ~ ., training,
+                method = "knn",
+                preProcess = c("center","scale"),
+                #metric = "ROC",
+                tuneLength = 15,
+                trControl = over_sampling)
+
+# Training
+knn_train <- predict(knn_fit, type = "prob")
+
+# Quick look at the ROC - caret doesn't check probability threshold I think
+# Do it by hand for now, can write a function later
+
+knn_train_roc <- roc(training$event, knn_train$yes)
+
+# this shows the roc curve
+plot(knn_train_roc, print.thres = "best", print.thres.best.method = "closest.topleft")
+
+# look for the best top-left cutoff
+knn_train_coords <- coords(knn_train_roc, "best", best.method = "closest.topleft", ret = c("threshold", "accuracy"))
+
+knn_train_labels <- training %>%
+  mutate(predicted.value = factor(ifelse(knn_train[,2] <= knn_train_coords$threshold, "no", "yes"), levels = c("no", "yes")))
+
+knn_train_error <- calc_error_rate(predicted.value = knn_train_labels$predicted.value, true.value = training$event)
+
+# Test
+knn_test <- predict(knn_fit, newdata = test, type = "prob")
+
+knn_test_labels = test %>%
+  mutate(predicted.value = factor(ifelse(knn_test[,2] <= knn_train_coords$threshold, "no", "yes"), levels = c("no", "yes")))
+
+knn_test_error <- calc_error_rate(predicted.value = knn_test_labels$predicted.value, true.value = test$event)
+
+knn_test_roc <- roc(test$event, knn_test$yes)
+
+knn_test_coords <- coords(knn_test_roc, "best", best.method = "closest.topleft", ret = c("threshold", "accuracy"))
+
+# write down the training and test errors of the probit model 
+records[2,] <- c(knn_train_error, knn_test_error)
+```
+
+## Random forest
+
+```{r message=FALSE, warning = FALSE}
+set.seed(2019)
+
+rf_fit <- train(event ~ ., training,
+                method = "ranger",
+                tuneLength = 15,
+                #metric = "ROC",
+                trControl = over_sampling)
+
+# Training
+rf_train <- predict(rf_fit, training, type = "prob")
+
+# Quick look at the ROC - caret doesn't check probability threshold I think
+# Do it by hand for now, can write a function later
+
+rf_train_roc <- roc(training$event, rf_train$yes)
+
+# this shows the roc curve
+plot(rf_train_roc, print.thres = "best", print.thres.best.method = "closest.topleft")
+
+# look for the best top-left cutoff
+rf_train_coords <- coords(rf_train_roc, "best", best.method = "closest.topleft", ret = c("threshold", "accuracy"))
+
+rf_train_labels <- training %>%
+  mutate(predicted.value = factor(ifelse(rf_train[,2] <= rf_train_coords$threshold, "no", "yes"), levels = c("no", "yes")))
+
+rf_train_error <- calc_error_rate(predicted.value = rf_train_labels$predicted.value, true.value = training$event)
+
+# Test
+rf_test <- predict(rf_fit, newdata = test, type = "prob")
+
+rf_test_labels = test %>%
+  mutate(predicted.value = factor(ifelse(rf_test[,2] <= rf_train_coords$threshold, "no", "yes"), levels = c("no", "yes")))
+
+rf_test_error <- calc_error_rate(predicted.value = rf_test_labels$predicted.value, true.value = test$event)
+
+rf_test_roc <- roc(test$event, rf_test$yes)
+
+rf_test_coords <- coords(rf_test_roc, "best", best.method = "closest.topleft", ret = c("threshold", "accuracy"))
+
+# write down the training and test errors of the probit model 
+records[3,] <- c(rf_train_error, rf_test_error)
+```
+
+## SVM
+
+```{r message=FALSE, warning = FALSE}
+set.seed(2019)
+
+svm_fit <- train(event ~ ., training,
+                method = "svmLinear",
+                preProcess = c("center","scale"),
+                tuneLength = 15,
+                #metric = "ROC",
+                trControl = over_sampling)
+
+# Training
+svm_train <- predict(svm_fit, type = "prob")
+
+# Quick look at the ROC - caret doesn't check probability threshold I think
+# Do it by hand for now, can write a function later
+
+svm_train_roc <- roc(training$event, svm_train$yes)
+
+# this shows the roc curve
+plot(svm_train_roc, print.thres = "best", print.thres.best.method = "closest.topleft")
+
+# look for the best top-left cutoff
+svm_train_coords <- coords(svm_train_roc, "best", best.method = "closest.topleft", ret = c("threshold", "accuracy"))
+
+svm_train_labels <- training %>%
+  mutate(predicted.value = factor(ifelse(svm_train[,2] <= svm_train_coords$threshold, "no", "yes"), levels = c("no", "yes")))
+
+svm_train_error <- calc_error_rate(predicted.value = svm_train_labels$predicted.value, true.value = training$event)
+
+# Test
+svm_test <- predict(svm_fit, newdata = test, type = "prob")
+
+svm_test_labels = test %>%
+  mutate(predicted.value = factor(ifelse(svm_test[,2] <= svm_train_coords$threshold, "no", "yes"), levels = c("no", "yes")))
+
+svm_test_error <- calc_error_rate(predicted.value = svm_test_labels$predicted.value, true.value = test$event)
+
+svm_test_roc <- roc(test$event, svm_test$yes)
+
+svm_test_coords <- coords(svm_test_roc, "best", best.method = "closest.topleft", ret = c("threshold", "accuracy"))
+
+svm_test_error <- calc_error_rate(predicted.value = svm_test_labels$predicted.value, true.value = test$event)
+
+# write down the training and test errors of the probit model 
+records[4,] <- c(svm_train_error, svm_test_error)
+```
+
+# Model metrics
+
+## Accuracy
+
+I won't read too much into it as it's a imbalanced class problem.
+
+```{r, echo=FALSE}
+records
+```
+
+
+## ROC curves
+
+This is more important.
+
+```{r message=FALSE, warning = FALSE}
+#ROC on test data
+
+# probit
+pred_prob <- prediction(prob_test, test$event)
+performance_prob <- performance(pred_prob, measure = "tpr", x.measure="fpr")
+
+# knn
+pred_knn <- prediction(knn_test[,2], test$event)
+performance_knn <- performance(pred_knn, measure = "tpr", x.measure="fpr")
+
+# rf
+pred_rf <- prediction(rf_test[,2], test$event)
+performance_rf <- performance(pred_rf, measure = "tpr", x.measure="fpr")
+
+# svm
+pred_svm <- prediction(svm_test[,2], test$event)
+performance_svm <- performance(pred_svm, measure = "tpr", x.measure="fpr")
+
+#plot
+plot(performance_prob, col = 2, lwd = 2, main = "ROC Curves for These Two Classification Methods in Test Data")
+
+legend(0.6, 0.6, c("Probit", "KNN", "Random Forests", "SVM"), 2:5)
+
+#others
+plot(performance_knn,col=3,lwd=2,add=TRUE)
+plot(performance_rf,col=4,lwd=2,add=TRUE)
+plot(performance_svm,col=5,lwd=2,add=TRUE)
+
+abline(0,1)
+```
+
+## AUC
+
+Random forest and KNN stand out but not by much.
+
+```{r, echo=FALSE}
+Area_Under_the_Curve = matrix(NA, nrow=4, ncol=1)
+colnames(Area_Under_the_Curve) <- c("AUC") 
+rownames(Area_Under_the_Curve) <- c("Probit", "KNN", "Random Forests", "SVM")
+
+auc_probit <-performance(pred_prob, "auc")@y.values
+Area_Under_the_Curve[1,] <-c(as.numeric(auc_probit))
+
+auc_knn <- performance(pred_knn,"auc")@y.values
+Area_Under_the_Curve[2,] <- c(as.numeric(auc_knn))
+
+auc_rf <- performance(pred_rf,"auc")@y.values
+Area_Under_the_Curve[3,] <- c(as.numeric(auc_rf))
+
+auc_svm <- performance(pred_svm,"auc")@y.values[[1]]
+Area_Under_the_Curve[4,] <- c(as.numeric(auc_svm))
+
+Area_Under_the_Curve
+```
+
+## Confusion Matrix
+
+```{r, echo=FALSE, include=F}
+confusion <- lapply(list(prob_test_labels, knn_test_labels, rf_test_labels, svm_test_labels), function(x) {
+  
+  confusionMatrix(x$predicted.value, x$event)
+  
+})
+
+make_confusion_kable <- function(cm) {
+  
+  table = cm$table
+  
+  colnames(table) = paste0("Actual = ", colnames(table))
+  rownames(table) = paste0("Prediction = ", rownames(table))
+  
+  return(table)
+  
+}
+
+tidied_tables <- lapply(confusion, make_confusion_kable)
+```
+
+## Trade offs between sensitivity and specificity
+
+Looks like SVM doesn't bring much to the table...
+
+```{r message=FALSE, warning = FALSE}
+# switching it because the way our table is made
+sensitivity <- lapply(confusion, function(x) {data.frame("Sensitivity" = as.numeric(x$byClass[2]))}) %>% bind_rows()
+specificity <- lapply(confusion, function(x) {data.frame("Specificity" = as.numeric(x$byClass[1]))}) %>% bind_rows()   
+
+main_metrics <- data.frame("Model" = c("probit", "knn", "random forest", "svm"),
+                           sensitivity, specificity)
+
+main_metrics_plot <- main_metrics %>% melt(id.var = "Model") %>%
+  ggplot(aes(x = Model, y = value)) +
+  geom_col(aes(fill = Model)) +
+  facet_wrap(~variable) +
+  labs(title = "Model trade-offs in test data: Sensitivity = True Positive Rate,\nSpecificity = 1 - (False Alarm Rate)")
+
+main_metrics_plot
+```
+
+Probit
+```{r echo=FALSE}
+tidied_tables[[1]]
+```
+
+KNN
+```{r echo=FALSE}
+tidied_tables[[2]]
+```
+
+Random Forest
+```{r echo=FALSE}
+tidied_tables[[3]]
+```
+
+SVM
+```{r echo=FALSE}
+tidied_tables[[4]]
+```
+
+# References
