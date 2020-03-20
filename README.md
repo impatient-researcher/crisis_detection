@@ -1,6 +1,6 @@
 ## Navigation
 
-### frankel_rose > literature_replication2.Rmd
+### 1. frankel_rose > literature_replication2.Rmd
 
 #### Goals
 1. Replicate Frankel and Rose (1996) which is a simple probit model but choose probability cutoff to maximise the area under the ROC curve.
@@ -16,7 +16,7 @@
 
 3. We may want to try neural networks as they are rare in the literature so far and they have some attractive features - see below description.
 
-### toy_autoencoder.ipynb
+### 2. toy_autoencoder.ipynb
 
 Here I used another dataset from JST which has been used by quite a few papers.
 
